@@ -27,10 +27,9 @@ fn create_processor() -> Processor {
     let config = ProcessorConfig {
         echo_cancellation: Some(EchoCancellation {
             suppression_level: EchoCancellationSuppressionLevel::Low,
-            // stream_delay_ms: Some(16), // remove this in production, zach
+            stream_delay_ms: Some(16),
             enable_delay_agnostic: false,
-            stream_delay_ms: None,
-            enable_extended_filter: true
+            enable_extended_filter: false
         }),
         noise_suppression: Some(NoiseSuppression {
             suppression_level: NoiseSuppressionLevel::High,
@@ -111,8 +110,8 @@ fn main() {
         // let mut processor_input = create_processor();
 
         let mut noise_gate = NoiseGate::new(-23.5, 0.01, 0.0001, 0.02, 0.3, 48000.0);
-        // let cutoff_freq = 3000.0;
-        // let mut low_pass_filter = LowPassFilter::new(cutoff_freq, 48000.0);
+        let cutoff_freq = 3000.0;
+        let mut low_pass_filter = LowPassFilter::new(cutoff_freq, 48000.0);
 
         let mut encoder =
             Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip).unwrap();
@@ -126,12 +125,12 @@ fn main() {
             // let mut low_pass_buffer = [0.0f32; BUFFER_SIZE];
             // low_pass_filter.process(&data, &mut low_pass_buffer);
 
-            let mut final_buffer = [0.0f32; BUFFER_SIZE];
-            noise_gate.process_block(&data, &mut final_buffer);
+            // let mut final_buffer = [0.0f32; BUFFER_SIZE];
+            // noise_gate.process_block(&low_pass_buffer, &mut final_buffer);
 
             if let Ok(chunk) = prod.write_chunk_uninit(BUFFER_SIZE) {
                 let mut encoded_buffer = [0u8; BUFFER_SIZE];
-                let _ = encoder.encode_float(&final_buffer, &mut encoded_buffer);
+                let _ = encoder.encode_float(&data, &mut encoded_buffer);
                 chunk.fill_from_iter(encoded_buffer.to_owned());
             }
         }
