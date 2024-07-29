@@ -1,0 +1,17 @@
+FFT Notes:
+
+# Polynomial Representation
+- Coefficient representation: [1, 5, 7]
+    - 1 + 5x^2 + 7x^3
+
+- Value representation: any set of points can create a polynomial 
+   - (-1, 0), (3, 7), (-5, 4) could create a polynomial
+   - {(x0, P(x0)), (x1, (P(x1)) ..... (xD, P(xD)) }
+   - Polynomail multiplication is much easier
+   - Degree 3 polynomial = 4 points 
+        -  (d+1) points creates a polynomial of degree d
+
+
+
+
+much better. this fixed the buzzing issue. however, another issue has appeared where if I make a prolonged "aaaaah" sound or hum a note loudly into my microphone, I'll hear it back normally for about a second until it suddenly switches to sounding distorted and as if I'm underwater. after about a second of me being quiet again does it return to normal. my thought was that this was because the extra data coming in from my "ahh" sound created more continuous data that needed to be accounted for. that's just a theory, I have no idea what the actual problem is. the audio isn't clipping, and a noise gate won't be necesary. also remember that this program is just recording my voice and playing back into my headphones, there is no audio transmission goign on here. (yet.) any ideas? 
