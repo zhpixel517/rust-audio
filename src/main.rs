@@ -8,8 +8,14 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use low_pass_filter::LowPassFilter;
 use noise_gate::NoiseGate;
 use opus::{packet, Decoder, Encoder};
+use rtcp::payload_feedbacks;
+use rtp::sequence;
+use rtp_rs::{RtpPacketBuilder, RtpReader, Seq};
 use rtrb::RingBuffer;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::VecDeque;
+use std::mem::MaybeUninit;
+use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,7 +55,19 @@ fn create_processor() -> Processor {
     processor
 } 
 
+const RTP_PORT: i32 = 37069;
+
 fn main() {
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    socket.set_nonblocking(true).unwrap();
+
+    let loopback: SocketAddr =  "127.0.0.1".parse().unwrap();
+    socket.bind(&loopback.into());
+
+    let socket_send = socket.try_clone().unwrap();
+    let socket_recv = socket;
+
     const SAMPLE_RATE: usize = 48000;
     const BUFFER_SIZE: usize = 480;
     // https://arc.net/e/BDDA7654-F9B3-44BC-91A8-3FC502FDB960
@@ -117,22 +135,41 @@ fn main() {
             Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip).unwrap();
         // encoder.set_bitrate(opus::Bitrate::Auto).unwrap();
 
+        let mut sequence_number = 0;
+        let mut timestamp = 0;
+
         while let Ok(mut data) = rx_i.recv() {
             let mut ap = echo_processor_input.lock().unwrap();
             let _ = ap.process_capture_frame(&mut data);
             drop(ap);
 
+            let mut encoded_buffer = [0u8; BUFFER_SIZE];
+            let encoded_len = encoder.encode_float(&data, &mut encoded_buffer).unwrap();
+
+            let mut rtp_packet = RtpPacketBuilder::new()
+                .payload_type(111)
+                .sequence(sequence_number.into())
+                .timestamp(timestamp)
+                .ssrc(0x12345678) //random
+                .payload(&encoded_buffer[..encoded_len])
+                .build().unwrap();
+                
+
+            let _ = socket_send.send_to(&rtp_packet, &loopback.into());
+            
+            sequence_number = sequence_number.wrapping_add(1);
+            timestamp += BUFFER_SIZE as u32;
             // let mut low_pass_buffer = [0.0f32; BUFFER_SIZE];
             // low_pass_filter.process(&data, &mut low_pass_buffer);
 
             // let mut final_buffer = [0.0f32; BUFFER_SIZE];
             // noise_gate.process_block(&low_pass_buffer, &mut final_buffer);
 
-            if let Ok(chunk) = prod.write_chunk_uninit(BUFFER_SIZE) {
-                let mut encoded_buffer = [0u8; BUFFER_SIZE];
-                let _ = encoder.encode_float(&data, &mut encoded_buffer);
-                chunk.fill_from_iter(encoded_buffer.to_owned());
-            }
+            // if let Ok(chunk) = prod.write_chunk_uninit(BUFFER_SIZE) {
+            //     let mut encoded_buffer = [0u8; BUFFER_SIZE];
+            //     let _ = encoder.encode_float(&data, &mut encoded_buffer);
+            //     chunk.fill_from_iter(encoded_buffer.to_owned());
+            // }
         }
     });
 
@@ -177,35 +214,67 @@ fn main() {
         // let mut processor_output = create_processor();
         let mut decoder = Decoder::new(48000, opus::Channels::Mono).unwrap();
         let mut decode_buffer = [0.0f32; MAX_DECODE_BUFFER_SIZE];
+        let mut recv_buffer = [MaybeUninit::uninit(); 1500];
 
         loop {
-            if let Ok(chunk) = cons.read_chunk(BUFFER_SIZE) {
-                let (first, second) = chunk.as_slices();
-                let mut combined = [0u8; BUFFER_SIZE];
-                combined[..first.len()].copy_from_slice(first);
-                if !second.is_empty() {
-                    combined[first.len()..first.len() + second.len()].copy_from_slice(second);
+            match socket_recv.recv_from(&mut recv_buffer) {
+                Ok((size, _)) => {
+                    // let rtp_packet = RtpReader::new(&recv_buffer[..size]).unwrap();
+                    let data: &[u8] = unsafe {
+                        std::slice::from_raw_parts(recv_buffer.as_ptr() as *const u8, size)
+                    };
+
+                    let packet = RtpReader::new(data).unwrap().payload();
+
+                    if let Ok(decoded_samples) = decoder.decode_float(packet, &mut decode_buffer, false) {
+                        let mut buffer_to_send = [0.0f32; BUFFER_SIZE];
+                        let len = decoded_samples.min(BUFFER_SIZE);
+                        buffer_to_send[..len].copy_from_slice(&decode_buffer[..len]);
+
+                        let mut ap = echo_processor_output.lock().unwrap();
+                        ap.process_render_frame(&mut buffer_to_send);
+                        drop(ap);
+
+                        let _ = tx_o.send(buffer_to_send);
+                    } else {
+                        println!("Decode sample error");
+                    }
                 }
-
-                if let Ok(decoded_samples) =
-                    decoder.decode_float(&combined, &mut decode_buffer, false)
-                {
-                    let mut buffer_to_send = [0.0f32; BUFFER_SIZE];
-                    let len = decoded_samples.min(BUFFER_SIZE);
-                    buffer_to_send[..len].copy_from_slice(&decode_buffer[..len]);
-
-                    let mut ap = echo_processor_output.lock().unwrap();
-                    ap.process_render_frame(&mut buffer_to_send);
-                    drop(ap);
-
-                    let _ = tx_o.send(buffer_to_send);
-                } else {
-                    println!("Decode sample error");
-                }
-                chunk.commit_all();
-            } else {
-                println!("Chunk read error");
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // no data available, continue loop
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                },
+                Err(e) => {
+                    eprintln!("Error receiving data: {:?}", e);
+                },
             }
+            // if let Ok(chunk) = cons.read_chunk(BUFFER_SIZE) {
+            //     let (first, second) = chunk.as_slices();
+            //     let mut combined = [0u8; BUFFER_SIZE];
+            //     combined[..first.len()].copy_from_slice(first);
+            //     if !second.is_empty() {
+            //         combined[first.len()..first.len() + second.len()].copy_from_slice(second);
+            //     }
+
+            //     if let Ok(decoded_samples) =
+            //         decoder.decode_float(&combined, &mut decode_buffer, false)
+            //     {
+            //         let mut buffer_to_send = [0.0f32; BUFFER_SIZE];
+            //         let len = decoded_samples.min(BUFFER_SIZE);
+            //         buffer_to_send[..len].copy_from_slice(&decode_buffer[..len]);
+
+            //         let mut ap = echo_processor_output.lock().unwrap();
+            //         ap.process_render_frame(&mut buffer_to_send);
+            //         drop(ap);
+
+            //         let _ = tx_o.send(buffer_to_send);
+            //     } else {
+            //         println!("Decode sample error");
+            //     }
+            //     chunk.commit_all();
+            // } else {
+            //     println!("Chunk read error");
+            // }
         }
     });
 
